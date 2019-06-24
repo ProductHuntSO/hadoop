@@ -21,6 +21,7 @@ import static org.apache.hadoop.hdfs.server.federation.FederationTestUtils.getBe
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertFalse;
 
 import java.io.IOException;
 import java.util.Iterator;
@@ -43,34 +44,36 @@ import org.junit.Test;
 /**
  * Test the JMX interface for the {@link Router}.
  */
-public class TestFederationMetrics extends TestMetricsBase {
+public class TestRBFMetrics extends TestMetricsBase {
 
   public static final String FEDERATION_BEAN =
       "Hadoop:service=Router,name=FederationState";
-  public static final String STATE_STORE_BEAN =
-      "Hadoop:service=Router,name=StateStore";
-  public static final String RPC_BEAN =
-      "Hadoop:service=Router,name=FederationRPC";
+  public static final String ROUTER_BEAN =
+      "Hadoop:service=Router,name=Router";
 
   @Test
   public void testClusterStatsJMX()
       throws MalformedObjectNameException, IOException {
 
-    FederationMBean bean = getBean(FEDERATION_BEAN, FederationMBean.class);
-    validateClusterStatsBean(bean);
+    FederationMBean federationBean = getBean(FEDERATION_BEAN,
+        FederationMBean.class);
+    validateClusterStatsFederationBean(federationBean);
+    RouterMBean routerBean = getBean(ROUTER_BEAN, RouterMBean.class);
+    validateClusterStatsRouterBean(routerBean);
   }
 
   @Test
   public void testClusterStatsDataSource() throws IOException {
-    FederationMetrics metrics = getRouter().getMetrics();
-    validateClusterStatsBean(metrics);
+    RBFMetrics metrics = getRouter().getMetrics();
+    validateClusterStatsFederationBean(metrics);
+    validateClusterStatsRouterBean(metrics);
   }
 
   @Test
   public void testMountTableStatsDataSource()
       throws IOException, JSONException {
 
-    FederationMetrics metrics = getRouter().getMetrics();
+    RBFMetrics metrics = getRouter().getMetrics();
     String jsonString = metrics.getMountTable();
     JSONArray jsonArray = new JSONArray(jsonString);
     assertEquals(jsonArray.length(), getMockMountTable().size());
@@ -116,7 +119,7 @@ public class TestFederationMetrics extends TestMetricsBase {
   @Test
   public void testNamenodeStatsDataSource() throws IOException, JSONException {
 
-    FederationMetrics metrics = getRouter().getMetrics();
+    RBFMetrics metrics = getRouter().getMetrics();
     String jsonString = metrics.getNamenodes();
     JSONObject jsonObject = new JSONObject(jsonString);
     Iterator<?> keys = jsonObject.keys();
@@ -137,12 +140,20 @@ public class TestFederationMetrics extends TestMetricsBase {
           stats.getNumOfActiveDatanodes());
       assertEquals(json.getLong("numOfDeadDatanodes"),
           stats.getNumOfDeadDatanodes());
+      assertEquals(json.getLong("numOfStaleDatanodes"),
+          stats.getNumOfStaleDatanodes());
       assertEquals(json.getLong("numOfDecommissioningDatanodes"),
           stats.getNumOfDecommissioningDatanodes());
       assertEquals(json.getLong("numOfDecomActiveDatanodes"),
           stats.getNumOfDecomActiveDatanodes());
       assertEquals(json.getLong("numOfDecomDeadDatanodes"),
           stats.getNumOfDecomDeadDatanodes());
+      assertEquals(json.getLong("numOfInMaintenanceLiveDataNodes"),
+          stats.getNumOfInMaintenanceLiveDataNodes());
+      assertEquals(json.getLong("numOfInMaintenanceDeadDataNodes"),
+          stats.getNumOfInMaintenanceDeadDataNodes());
+      assertEquals(json.getLong("numOfEnteringMaintenanceDataNodes"),
+          stats.getNumOfEnteringMaintenanceDataNodes());
       assertEquals(json.getLong("numOfBlocks"), stats.getNumOfBlocks());
       assertEquals(json.getString("rpcAddress"), mockEntry.getRpcAddress());
       assertEquals(json.getString("webAddress"), mockEntry.getWebAddress());
@@ -157,7 +168,7 @@ public class TestFederationMetrics extends TestMetricsBase {
   public void testNameserviceStatsDataSource()
       throws IOException, JSONException {
 
-    FederationMetrics metrics = getRouter().getMetrics();
+    RBFMetrics metrics = getRouter().getMetrics();
     String jsonString = metrics.getNameservices();
     JSONObject jsonObject = new JSONObject(jsonString);
     Iterator<?> keys = jsonObject.keys();
@@ -187,12 +198,20 @@ public class TestFederationMetrics extends TestMetricsBase {
           json.getLong("numOfActiveDatanodes"));
       assertEquals(stats.getNumOfDeadDatanodes(),
           json.getLong("numOfDeadDatanodes"));
+      assertEquals(stats.getNumOfStaleDatanodes(),
+          json.getLong("numOfStaleDatanodes"));
       assertEquals(stats.getNumOfDecommissioningDatanodes(),
           json.getLong("numOfDecommissioningDatanodes"));
       assertEquals(stats.getNumOfDecomActiveDatanodes(),
           json.getLong("numOfDecomActiveDatanodes"));
       assertEquals(stats.getNumOfDecomDeadDatanodes(),
           json.getLong("numOfDecomDeadDatanodes"));
+      assertEquals(stats.getNumOfInMaintenanceLiveDataNodes(),
+          json.getLong("numOfInMaintenanceLiveDataNodes"));
+      assertEquals(stats.getNumOfInMaintenanceDeadDataNodes(),
+          json.getLong("numOfInMaintenanceDeadDataNodes"));
+      assertEquals(stats.getNumOfStaleDatanodes(),
+          json.getLong("numOfEnteringMaintenanceDataNodes"));
       assertEquals(stats.getProvidedSpace(),
           json.getLong("providedSpace"));
       nameservicesFound++;
@@ -203,7 +222,7 @@ public class TestFederationMetrics extends TestMetricsBase {
   @Test
   public void testRouterStatsDataSource() throws IOException, JSONException {
 
-    FederationMetrics metrics = getRouter().getMetrics();
+    RBFMetrics metrics = getRouter().getMetrics();
     String jsonString = metrics.getRouters();
     JSONObject jsonObject = new JSONObject(jsonString);
     Iterator<?> keys = jsonObject.keys();
@@ -224,10 +243,10 @@ public class TestFederationMetrics extends TestMetricsBase {
 
       StateStoreVersion version = router.getStateStoreVersion();
       assertEquals(
-          FederationMetrics.getDateString(version.getMembershipVersion()),
+          RBFMetrics.getDateString(version.getMembershipVersion()),
           json.get("lastMembershipUpdate"));
       assertEquals(
-          FederationMetrics.getDateString(version.getMountTableVersion()),
+          RBFMetrics.getDateString(version.getMountTableVersion()),
           json.get("lastMountTableUpdate"));
       assertEquals(version.getMembershipVersion(),
           json.get("membershipVersion"));
@@ -253,41 +272,57 @@ public class TestFederationMetrics extends TestMetricsBase {
     return null;
   }
 
-  private void validateClusterStatsBean(FederationMBean bean)
-      throws IOException {
+  private void validateClusterStatsFederationBean(FederationMBean bean) {
 
     // Determine aggregates
     long numBlocks = 0;
     long numLive = 0;
     long numDead = 0;
+    long numStale = 0;
     long numDecom = 0;
     long numDecomLive = 0;
     long numDecomDead = 0;
+    long numInMaintenanceLive = 0;
+    long numInMaintenanceDead = 0;
+    long numEnteringMaintenance = 0;
     long numFiles = 0;
     for (MembershipState mock : getActiveMemberships()) {
       MembershipStats stats = mock.getStats();
       numBlocks += stats.getNumOfBlocks();
       numLive += stats.getNumOfActiveDatanodes();
       numDead += stats.getNumOfDeadDatanodes();
+      numStale += stats.getNumOfStaleDatanodes();
       numDecom += stats.getNumOfDecommissioningDatanodes();
       numDecomLive += stats.getNumOfDecomActiveDatanodes();
       numDecomDead += stats.getNumOfDecomDeadDatanodes();
+      numInMaintenanceLive += stats.getNumOfInMaintenanceLiveDataNodes();
+      numInMaintenanceDead += stats.getNumOfInMaintenanceLiveDataNodes();
+      numEnteringMaintenance += stats.getNumOfEnteringMaintenanceDataNodes();
     }
 
     assertEquals(numBlocks, bean.getNumBlocks());
     assertEquals(numLive, bean.getNumLiveNodes());
     assertEquals(numDead, bean.getNumDeadNodes());
+    assertEquals(numStale, bean.getNumStaleNodes());
     assertEquals(numDecom, bean.getNumDecommissioningNodes());
     assertEquals(numDecomLive, bean.getNumDecomLiveNodes());
     assertEquals(numDecomDead, bean.getNumDecomDeadNodes());
+    assertEquals(numInMaintenanceLive, bean.getNumInMaintenanceLiveDataNodes());
+    assertEquals(numInMaintenanceDead, bean.getNumInMaintenanceDeadDataNodes());
+    assertEquals(numEnteringMaintenance,
+        bean.getNumEnteringMaintenanceDataNodes());
     assertEquals(numFiles, bean.getNumFiles());
     assertEquals(getActiveMemberships().size() + getStandbyMemberships().size(),
         bean.getNumNamenodes());
     assertEquals(getNameservices().size(), bean.getNumNameservices());
+  }
+
+  private void validateClusterStatsRouterBean(RouterMBean bean) {
     assertTrue(bean.getVersion().length() > 0);
     assertTrue(bean.getCompiledDate().length() > 0);
     assertTrue(bean.getCompileInfo().length() > 0);
     assertTrue(bean.getRouterStarted().length() > 0);
     assertTrue(bean.getHostAndPort().length() > 0);
+    assertFalse(bean.isSecurityEnabled());
   }
 }

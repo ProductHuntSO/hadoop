@@ -47,14 +47,18 @@ import javax.management.NotCompliantMBeanException;
 import javax.management.ObjectName;
 import javax.management.StandardMBean;
 
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants.DatanodeReportType;
 import org.apache.hadoop.hdfs.server.federation.resolver.ActiveNamenodeResolver;
 import org.apache.hadoop.hdfs.server.federation.resolver.FederationNamenodeContext;
 import org.apache.hadoop.hdfs.server.federation.resolver.FederationNamespaceInfo;
 import org.apache.hadoop.hdfs.server.federation.resolver.RemoteLocation;
+import org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys;
 import org.apache.hadoop.hdfs.server.federation.router.Router;
 import org.apache.hadoop.hdfs.server.federation.router.RouterRpcServer;
+import org.apache.hadoop.hdfs.server.federation.router.RouterServiceState;
+import org.apache.hadoop.hdfs.server.federation.router.security.RouterSecurityManager;
 import org.apache.hadoop.hdfs.server.federation.store.MembershipStore;
 import org.apache.hadoop.hdfs.server.federation.store.MountTableStore;
 import org.apache.hadoop.hdfs.server.federation.store.RouterStore;
@@ -73,7 +77,9 @@ import org.apache.hadoop.hdfs.server.federation.store.records.MembershipStats;
 import org.apache.hadoop.hdfs.server.federation.store.records.MountTable;
 import org.apache.hadoop.hdfs.server.federation.store.records.RouterState;
 import org.apache.hadoop.hdfs.server.federation.store.records.StateStoreVersion;
+import org.apache.hadoop.metrics2.annotation.Metrics;
 import org.apache.hadoop.metrics2.util.MBeans;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.VersionInfo;
 import org.codehaus.jettison.json.JSONObject;
@@ -86,23 +92,25 @@ import com.google.common.annotations.VisibleForTesting;
 /**
  * Implementation of the Router metrics collector.
  */
-public class FederationMetrics implements FederationMBean {
+@Metrics(name="RBFActivity", about="RBF metrics", context="dfs")
+public class RBFMetrics implements RouterMBean, FederationMBean {
 
   private static final Logger LOG =
-      LoggerFactory.getLogger(FederationMetrics.class);
+      LoggerFactory.getLogger(RBFMetrics.class);
 
   /** Format for a date. */
   private static final String DATE_FORMAT = "yyyy/MM/dd HH:mm:ss";
 
   /** Prevent holding the page from load too long. */
-  private static final long TIME_OUT = TimeUnit.SECONDS.toMillis(1);
+  private final long timeOut;
 
 
   /** Router interface. */
   private final Router router;
 
   /** FederationState JMX bean. */
-  private ObjectName beanName;
+  private ObjectName routerBeanName;
+  private ObjectName federationBeanName;
 
   /** Resolve the namenode for each namespace. */
   private final ActiveNamenodeResolver namenodeResolver;
@@ -117,15 +125,24 @@ public class FederationMetrics implements FederationMBean {
   private RouterStore routerStore;
 
 
-  public FederationMetrics(Router router) throws IOException {
+  public RBFMetrics(Router router) throws IOException {
     this.router = router;
 
     try {
-      StandardMBean bean = new StandardMBean(this, FederationMBean.class);
-      this.beanName = MBeans.register("Router", "FederationState", bean);
-      LOG.info("Registered Router MBean: {}", this.beanName);
+      StandardMBean bean = new StandardMBean(this, RouterMBean.class);
+      this.routerBeanName = MBeans.register("Router", "Router", bean);
+      LOG.info("Registered Router MBean: {}", this.routerBeanName);
     } catch (NotCompliantMBeanException e) {
       throw new RuntimeException("Bad Router MBean setup", e);
+    }
+
+    try {
+      StandardMBean bean = new StandardMBean(this, FederationMBean.class);
+      this.federationBeanName = MBeans.register("Router", "FederationState",
+          bean);
+      LOG.info("Registered FederationState MBean: {}", this.federationBeanName);
+    } catch (NotCompliantMBeanException e) {
+      throw new RuntimeException("Bad FederationState MBean setup", e);
     }
 
     // Resolve namenode for each nameservice
@@ -143,14 +160,23 @@ public class FederationMetrics implements FederationMBean {
       this.routerStore = stateStore.getRegisteredRecordStore(
           RouterStore.class);
     }
+
+    // Initialize the cache for the DN reports
+    Configuration conf = router.getConfig();
+    this.timeOut = conf.getTimeDuration(RBFConfigKeys.DN_REPORT_TIME_OUT,
+        RBFConfigKeys.DN_REPORT_TIME_OUT_MS_DEFAULT, TimeUnit.MILLISECONDS);
+
   }
 
   /**
    * Unregister the JMX beans.
    */
   public void close() {
-    if (this.beanName != null) {
-      MBeans.unregister(beanName);
+    if (this.routerBeanName != null) {
+      MBeans.unregister(routerBeanName);
+    }
+    if (this.federationBeanName != null) {
+      MBeans.unregister(federationBeanName);
     }
   }
 
@@ -262,6 +288,7 @@ public class FederationMetrics implements FederationMBean {
           innerInfo.put("order", "");
         }
         innerInfo.put("readonly", entry.isReadOnly());
+        innerInfo.put("faulttolerant", entry.isFaultTolerant());
         info.add(Collections.unmodifiableMap(innerInfo));
       }
     } catch (IOException e) {
@@ -406,6 +433,12 @@ public class FederationMetrics implements FederationMBean {
   }
 
   @Override
+  public int getNumStaleNodes() {
+    return getNameserviceAggregatedInt(
+        MembershipStats::getNumOfStaleDatanodes);
+  }
+
+  @Override
   public int getNumDecommissioningNodes() {
     return getNameserviceAggregatedInt(
         MembershipStats::getNumOfDecommissioningDatanodes);
@@ -423,6 +456,24 @@ public class FederationMetrics implements FederationMBean {
         MembershipStats::getNumOfDecomDeadDatanodes);
   }
 
+  @Override
+  public int getNumInMaintenanceLiveDataNodes() {
+    return getNameserviceAggregatedInt(
+        MembershipStats::getNumOfInMaintenanceLiveDataNodes);
+  }
+
+  @Override
+  public int getNumInMaintenanceDeadDataNodes() {
+    return getNameserviceAggregatedInt(
+        MembershipStats::getNumOfInMaintenanceDeadDataNodes);
+  }
+
+  @Override
+  public int getNumEnteringMaintenanceDataNodes() {
+    return getNameserviceAggregatedInt(
+        MembershipStats::getNumOfEnteringMaintenanceDataNodes);
+  }
+
   @Override // NameNodeMXBean
   public String getNodeUsage() {
     float median = 0;
@@ -434,7 +485,7 @@ public class FederationMetrics implements FederationMBean {
     try {
       RouterRpcServer rpcServer = this.router.getRpcServer();
       DatanodeInfo[] live = rpcServer.getDatanodeReport(
-          DatanodeReportType.LIVE, false, TIME_OUT);
+          DatanodeReportType.LIVE, false, timeOut);
 
       if (live.length > 0) {
         float totalDfsUsed = 0;
@@ -568,7 +619,45 @@ public class FederationMetrics implements FederationMBean {
 
   @Override
   public String getRouterStatus() {
-    return "RUNNING";
+    return this.router.getRouterState().toString();
+  }
+
+  @Override
+  public long getCurrentTokensCount() {
+    RouterSecurityManager mgr =
+        this.router.getRpcServer().getRouterSecurityManager();
+    if (mgr != null && mgr.getSecretManager() != null) {
+      return mgr.getSecretManager().getCurrentTokensSize();
+    }
+    return -1;
+  }
+
+  @Override
+  public boolean isSecurityEnabled() {
+    return UserGroupInformation.isSecurityEnabled();
+  }
+
+  @Override
+  public String getSafemode() {
+    if (this.router.isRouterState(RouterServiceState.SAFEMODE)) {
+      return "Safe mode is ON. " + this.getSafeModeTip();
+    } else {
+      return "";
+    }
+  }
+
+  private String getSafeModeTip() {
+    String cmd = "Use \"hdfs dfsrouteradmin -safemode leave\" "
+        + "to turn safe mode off.";
+    if (this.router.isRouterState(RouterServiceState.INITIALIZING)
+        || this.router.isRouterState(RouterServiceState.UNINITIALIZED)) {
+      return "Router is in" + this.router.getRouterState()
+          + "mode, the router will immediately return to "
+          + "normal mode after some time. " + cmd;
+    } else if (this.router.isRouterState(RouterServiceState.SAFEMODE)) {
+      return "It was turned on manually. " + cmd;
+    }
+    return "";
   }
 
   /**
